@@ -1,0 +1,41 @@
+{
+  "total_pages_in_index": 761,
+  "groups": {
+    "公告": {
+      "seed_file": "pages/387_page.md",
+      "output_file": "01_announcements.md",
+      "count": 163
+    },
+    "角色": {
+      "seed_file": "pages/83_page.md",
+      "output_file": "02_characters.md",
+      "count": 62
+    },
+    "剧情故事": {
+      "seed_file": "pages/25561_page.md",
+      "output_file": "03_story.md",
+      "count": 112
+    },
+    "地图": {
+      "seed_file": "pages/92_page.md",
+      "output_file": "04_maps.md",
+      "count": 28
+    },
+    "活动": {
+      "seed_file": "pages/1499_page.md",
+      "output_file": "05_events.md",
+      "count": 1
+    },
+    "武器": {
+      "seed_file": "pages/444_page.md",
+      "output_file": "06_weapons.md",
+      "count": 40
+    },
+    "其他": {
+      "seed_file": null,
+      "output_file": "07_others.md",
+      "count": 355
+    }
+  },
+  "total_assigned": 761
+}
