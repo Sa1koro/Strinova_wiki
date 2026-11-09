@@ -509,6 +509,22 @@ class MediaWikiCrawler:
         prefix, sep, _ = title.partition(":")
         return bool(sep) and prefix.strip().lower() in self.media_prefixes
 
+    def image_link_label(self, anchor) -> Optional[str]:
+        """Text for an emptied image link if it targets an article, else None."""
+        href = anchor.get("href")
+        if not href or href.startswith("#") or self.is_action_href(href):
+            return None
+        target_title = self.extract_title_from_href(href)
+        if not target_title or self.is_media_title(target_title):
+            return None
+        # Icon next to a text link to the same target is redundant.
+        for sibling in (anchor.find_previous_sibling("a"), anchor.find_next_sibling("a")):
+            if sibling is not None and sibling.get("href") == href and sibling.get_text(strip=True):
+                return None
+        # "角色阵营#乌尔比诺" -> "乌尔比诺": the section name is the meaningful part.
+        label = normalize_title(anchor.get("title") or target_title)
+        return label.rsplit("#", 1)[-1].strip() or None
+
     def resolve_local_file(self, title: str, title_to_file: Dict[str, str]) -> Optional[str]:
         key = title_key(title.split("#", 1)[0])
         key = self.redirects.get(key, key)
@@ -538,10 +554,14 @@ class MediaWikiCrawler:
 
         for anchor in soup.find_all("a"):
             href = anchor.get("href")
-            # Image-only anchors are empty once images are dropped.
+            # Image-only anchors are empty once images are dropped. Keep the ones
+            # pointing to articles (e.g. weapon icons) using the page title as text.
             if not anchor.get_text(strip=True) and not anchor.find("img"):
-                anchor.decompose()
-                continue
+                label = self.image_link_label(anchor)
+                if not label:
+                    anchor.decompose()
+                    continue
+                anchor.string = label
             # Self links and in-page anchors carry no information in a KB.
             if not href or href.startswith("#"):
                 anchor.unwrap()

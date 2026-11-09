@@ -13,6 +13,7 @@
   - 默认删除图片、音视频、媒体文件直链、目录、面包屑、编辑/历史/上传等 UI 链接
   - 未抓取页面与站外链接默认只保留文字（`--keep-external-links` 恢复）
   - 链接改写支持重定向（`乌尔比诺` → `角色阵营.md`）
+  - 只包着图片、指向条目的链接（如武器图标）保留为文字链接，避免链接图断开
   - 修复跨行链接文字、标题前缺少空行等 Markdown 排版问题
   - frontmatter 改为合法 YAML（JSON 转义），`source` 使用规范条目 URL，正文前增加 `# 标题`
   - 新参数：`--page`、`--remove-selector`、`--keep-images`、`--keep-external-links`
