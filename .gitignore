@@ -1,1 +1,14 @@
+# 旧版抓取结果（仅本地保留）
 klbq_00/*
+
+# 测试抓取输出
+klbq_test*/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# 系统 / 编辑器
+.DS_Store
+**/.obsidian/workspace*.json
