@@ -5,7 +5,7 @@ Generic MediaWiki crawler:
 2) Parses page HTML
 3) Cleans noisy wiki-specific nodes
 4) Converts HTML to Markdown
-5) Rewrites internal links to local Markdown files
+5) Rewrites internal links to local Markdown files (redirect-aware)
 """
 
 from __future__ import annotations
@@ -21,8 +21,8 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Pattern, Tuple
-from urllib.parse import parse_qs, unquote, urljoin, urlparse
+from typing import Dict, Iterable, List, Optional, Pattern, Set, Tuple
+from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -33,8 +33,12 @@ REMOVE_SELECTORS = (
     "script",
     "style",
     "noscript",
+    "audio",
+    "video",
     ".mw-editsection",
     ".mw-cite-backlink",
+    # MediaWiki marks direct links to media files (mp3/png...) with "internal".
+    "a.internal",
     ".catlinks",
     ".printfooter",
     ".mw-authority-control",
@@ -43,7 +47,21 @@ REMOVE_SELECTORS = (
     "div.navbox",
     "table.vertical-navbox",
     "div.hatnote.navigation-not-searchable",
+    # Table of contents and breadcrumbs only duplicate headings/links.
+    "#toc",
+    ".toc",
+    "[class*=breadcrumb]",
 )
+
+# Query keys that mark UI links (edit, history, purge, short url...), not articles.
+ACTION_QUERY_KEYS = {"action", "oldid", "diff", "curid", "printable", "veaction", "wpDestFile"}
+
+# Characters that are illegal in file names or break Markdown/Obsidian links.
+UNSAFE_FILENAME_RE = re.compile(r'[\\/:*?"<>|#^\[\]()\s]+')
+LINK_TEXT_RE = re.compile(r"\[([^\]]*)\]\(")
+
+# Namespaces whose links point to media, not articles: File(6), Media(-2).
+MEDIA_NAMESPACE_IDS = {"6", "-2"}
 
 
 DEFAULT_EXCLUDE_TITLE_PATTERNS = [
@@ -75,12 +93,20 @@ def normalize_title(title: str) -> str:
     return title.strip()
 
 
-def safe_stem_from_title(title: str, max_len: int = 80) -> str:
-    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", title.strip())
+def title_key(title: str) -> str:
+    """Lookup key for titles; MediaWiki treats the first letter case-insensitively."""
+    title = normalize_title(title)
+    return title[:1].upper() + title[1:]
+
+
+def safe_stem_from_title(title: str, max_len: int = 60) -> str:
+    # Keep CJK and other Unicode; only replace characters unsafe for paths/links.
+    # 60 chars keeps CJK names (3 bytes each) under the 255-byte filename limit.
+    stem = UNSAFE_FILENAME_RE.sub("_", title.strip())
     stem = re.sub(r"_+", "_", stem).strip("._")
     if not stem:
         stem = "page"
-    return stem[:max_len]
+    return stem[:max_len].rstrip("._") or "page"
 
 
 def compile_title_patterns(patterns: List[str]) -> List[Pattern[str]]:
@@ -112,6 +138,9 @@ class MediaWikiCrawler:
             "Chrome/124.0.0.0 Safari/537.36"
         ),
         min_request_interval: float = 0.25,
+        keep_images: bool = False,
+        keep_external_links: bool = False,
+        extra_remove_selectors: Optional[List[str]] = None,
     ) -> None:
         self.wiki_url = wiki_url.rstrip("/") + "/"
         self.api_url = api_url
@@ -120,6 +149,9 @@ class MediaWikiCrawler:
         self.max_retries = max_retries
         self.user_agent = user_agent
         self.min_request_interval = max(0.0, float(min_request_interval))
+        self.keep_images = keep_images
+        self.keep_external_links = keep_external_links
+        self.remove_selectors = list(REMOVE_SELECTORS) + list(extra_remove_selectors or [])
         self.session = requests.Session()
         self._request_lock = threading.Lock()
         self._last_request_at = 0.0
@@ -132,6 +164,9 @@ class MediaWikiCrawler:
         self.article_prefix = "/"
         self.script_path = "/index.php"
         self.category_prefix = "Category"
+        self.media_prefixes: Set[str] = {"file", "image", "media"}
+        # Redirect title key -> target title key, filled by fetch_redirect_map().
+        self.redirects: Dict[str, str] = {}
 
     def api_get(self, params: Dict[str, object]) -> Dict[str, object]:
         payload = dict(params)
@@ -183,12 +218,22 @@ class MediaWikiCrawler:
             {
                 "action": "query",
                 "meta": "siteinfo",
-                "siprop": "general|namespaces",
+                "siprop": "general|namespaces|namespacealiases",
             }
         )
         query = data.get("query", {})
         general = query.get("general", {}) or {}
         namespaces = query.get("namespaces", {}) or {}
+        aliases = query.get("namespacealiases", []) or []
+
+        for ns_id, value in namespaces.items():
+            if str(ns_id) in MEDIA_NAMESPACE_IDS and isinstance(value, dict):
+                for key in ("name", "canonical"):
+                    if value.get(key):
+                        self.media_prefixes.add(str(value[key]).lower())
+        for alias in aliases:
+            if str(alias.get("id")) in MEDIA_NAMESPACE_IDS and alias.get("alias"):
+                self.media_prefixes.add(str(alias["alias"]).lower())
 
         self.siteinfo = {
             "general": general,
@@ -372,6 +417,54 @@ class MediaWikiCrawler:
 
         return list(page_by_id.values()) + list(page_by_title.values())
 
+    def list_pages_by_titles(self, titles: List[str]) -> List[PageInfo]:
+        """Resolve explicit page titles (following redirects) to PageInfo."""
+        pages: Dict[int, PageInfo] = {}
+        for start in range(0, len(titles), 50):
+            batch = [normalize_title(t) for t in titles[start : start + 50] if t]
+            data = self.api_get(
+                {"action": "query", "titles": "|".join(batch), "redirects": 1}
+            )
+            for item in data.get("query", {}).get("pages", []) or []:
+                if item.get("missing") or item.get("invalid"):
+                    print(f"[warn] page not found: {item.get('title')}", file=sys.stderr)
+                    continue
+                page = PageInfo(
+                    pageid=int(item["pageid"]),
+                    ns=int(item["ns"]),
+                    title=str(item["title"]),
+                    is_redirect=False,
+                )
+                pages[page.pageid] = page
+        return list(pages.values())
+
+    def fetch_redirect_map(self, pages: List[PageInfo]) -> Dict[str, str]:
+        """Map every redirect pointing at a crawled page to that page's title key."""
+        page_ids = [p.pageid for p in pages if p.pageid > 0]
+        redirects: Dict[str, str] = {}
+        for start in range(0, len(page_ids), 50):
+            batch = page_ids[start : start + 50]
+            continuation: Dict[str, object] = {}
+            while True:
+                params: Dict[str, object] = {
+                    "action": "query",
+                    "prop": "redirects",
+                    "pageids": "|".join(str(i) for i in batch),
+                    "rdprop": "title",
+                    "rdlimit": "max",
+                }
+                params.update(continuation)
+                data = self.api_get(params)
+                for item in data.get("query", {}).get("pages", []) or []:
+                    target = title_key(str(item.get("title", "")))
+                    for rd in item.get("redirects", []) or []:
+                        redirects[title_key(str(rd["title"]))] = target
+                if "continue" not in data:
+                    break
+                continuation = data["continue"]
+        self.redirects = redirects
+        return redirects
+
     def parse_page(self, title: str) -> Dict[str, object]:
         return self.api_get(
             {
@@ -400,13 +493,26 @@ class MediaWikiCrawler:
         path = parsed.path
         if path.startswith(self.article_prefix):
             title = path[len(self.article_prefix) :]
-            if title:
+            if title and not path.startswith(self.script_path):
                 return normalize_title(title)
 
-        if path == self.script_path and "title" in query and query["title"]:
-            return normalize_title(query["title"][0])
-
         return None
+
+    def is_action_href(self, href: str) -> bool:
+        """True for same-site UI links such as edit/history/purge/short-url."""
+        parsed = urlparse(urljoin(self.wiki_url, href))
+        if parsed.netloc != self.root_host:
+            return False
+        return bool(ACTION_QUERY_KEYS & set(parse_qs(parsed.query)))
+
+    def is_media_title(self, title: str) -> bool:
+        prefix, sep, _ = title.partition(":")
+        return bool(sep) and prefix.strip().lower() in self.media_prefixes
+
+    def resolve_local_file(self, title: str, title_to_file: Dict[str, str]) -> Optional[str]:
+        key = title_key(title.split("#", 1)[0])
+        key = self.redirects.get(key, key)
+        return title_to_file.get(key)
 
     def clean_and_rewrite_html(
         self,
@@ -415,7 +521,7 @@ class MediaWikiCrawler:
     ) -> str:
         soup = BeautifulSoup(html, "html.parser")
 
-        for selector in REMOVE_SELECTORS:
+        for selector in self.remove_selectors:
             for node in soup.select(selector):
                 node.decompose()
 
@@ -425,21 +531,45 @@ class MediaWikiCrawler:
 
         for img in soup.find_all("img"):
             src = img.get("src")
-            if src:
+            if not self.keep_images:
+                img.decompose()
+            elif src:
                 img["src"] = urljoin(self.wiki_url, src)
 
         for anchor in soup.find_all("a"):
             href = anchor.get("href")
-            if not href:
+            # Image-only anchors are empty once images are dropped.
+            if not anchor.get_text(strip=True) and not anchor.find("img"):
+                anchor.decompose()
+                continue
+            # Self links and in-page anchors carry no information in a KB.
+            if not href or href.startswith("#"):
+                anchor.unwrap()
+                continue
+            if self.is_action_href(href):
+                anchor.decompose()
                 continue
 
             target_title = self.extract_title_from_href(href)
-            if target_title and target_title in title_to_file:
-                anchor["href"] = f"./{title_to_file[target_title]}"
-                continue
+            if target_title:
+                local_file = self.resolve_local_file(target_title, title_to_file)
+                if local_file:
+                    anchor["href"] = f"./{local_file}"
+                    anchor.attrs.pop("title", None)
+                    continue
+                if self.is_media_title(target_title):
+                    # Drop raw file names (e.g. "媒体文件:x.mp3"), keep real captions.
+                    file_name = target_title.partition(":")[2].strip()
+                    if file_name and file_name in anchor.get_text():
+                        anchor.decompose()
+                    else:
+                        anchor.unwrap()
+                    continue
 
-            if href.startswith("/"):
+            if self.keep_external_links:
                 anchor["href"] = urljoin(self.wiki_url, href)
+            else:
+                anchor.unwrap()
 
         return str(soup)
 
@@ -454,26 +584,33 @@ class MediaWikiCrawler:
             strip=["span"],
         )
         text = text.replace("\r\n", "\n")
+        # Link text spanning several lines (block elements inside <a>) breaks links.
+        text = LINK_TEXT_RE.sub(lambda m: "[" + " ".join(m.group(1).split()) + "](", text)
+        text = re.sub(r"[ \t]+\n", "\n", text)
+        # Headings directly after lists/paragraphs need a blank line to be parsed.
+        text = re.sub(r"\n(#{1,6} )", r"\n\n\1", text)
         text = re.sub(r"\n{3,}", "\n\n", text)
         return text.strip() + "\n"
 
+    def page_url(self, title: str) -> str:
+        path = self.article_prefix + quote(title.replace(" ", "_"), safe="/:")
+        return urljoin(self.wiki_url, path)
+
 
 def build_filename_mapping(pages: List[PageInfo]) -> Dict[str, str]:
+    """Map title key -> readable file name; stable across runs (ordered by pageid)."""
     used = set()
     mapping: Dict[str, str] = {}
 
-    for page in pages:
-        norm = normalize_title(page.title)
+    for page in sorted(pages, key=lambda p: p.pageid):
         stem = safe_stem_from_title(page.title)
-        filename = f"{page.pageid}_{stem}.md"
-
-        idx = 1
-        while filename.lower() in used:
-            filename = f"{page.pageid}_{stem}_{idx}.md"
-            idx += 1
+        filename = f"{stem}.md"
+        # Lower-cased check: macOS/Windows file systems are case-insensitive.
+        if filename.lower() in used:
+            filename = f"{stem}_{page.pageid}.md"
 
         used.add(filename.lower())
-        mapping[norm] = filename
+        mapping[title_key(page.title)] = filename
 
     return mapping
 
@@ -483,45 +620,45 @@ def write_page_markdown(
     page: PageInfo,
     title_to_file: Dict[str, str],
     pages_dir: Path,
-) -> Tuple[bool, str]:
+) -> Tuple[bool, str, List[str]]:
     try:
         parsed = crawler.parse_page(page.title)
         html = parsed.get("text", "")
         if not html:
-            return (False, f"empty content: {page.title}")
+            return (False, f"empty content: {page.title}", [])
 
         cleaned_html = crawler.clean_and_rewrite_html(html, title_to_file)
         markdown_body = crawler.html_to_markdown(cleaned_html)
 
-        categories_raw = parsed.get("categories", []) or []
+        # formatversion=2 returns {"category": ...}; v1 used "*".
         categories = []
-        for item in categories_raw:
-            title = item.get("title")
-            if title:
-                categories.append(str(title))
+        for item in parsed.get("categories", []) or []:
+            name = item.get("category") or item.get("*")
+            if name and not item.get("hidden"):
+                categories.append(normalize_title(str(name)))
 
-        source_url = urljoin(crawler.wiki_url, f"index.php?title={page.title}")
-        out_file = pages_dir / title_to_file[normalize_title(page.title)]
+        out_file = pages_dir / title_to_file[title_key(page.title)]
 
+        # json.dumps output is valid YAML and handles quotes/colons safely.
         yaml_lines = [
             "---",
-            f'title: "{page.title.replace(chr(34), chr(92) + chr(34))}"',
+            f"title: {json.dumps(page.title, ensure_ascii=False)}",
             f"pageid: {page.pageid}",
             f"namespace: {page.ns}",
-            f"source: {source_url}",
-            "categories:",
+            f"source: {crawler.page_url(page.title)}",
+            f"categories: {json.dumps(categories, ensure_ascii=False)}",
+            "---",
+            "",
+            f"# {page.title}",
+            "",
+            "",
         ]
-        if categories:
-            yaml_lines.extend(f"  - {c}" for c in categories)
-        else:
-            yaml_lines.append("  -")
-        yaml_lines.append("---\n")
 
         content = "\n".join(yaml_lines) + markdown_body
         out_file.write_text(content, encoding="utf-8")
-        return (True, page.title)
+        return (True, page.title, categories)
     except Exception as exc:  # pylint: disable=broad-except
-        return (False, f"{page.title}: {exc}")
+        return (False, f"{page.title}: {exc}", [])
 
 
 def write_indexes(
@@ -530,6 +667,7 @@ def write_indexes(
     title_to_file: Dict[str, str],
     siteinfo: Dict[str, object],
     namespace_ids: List[int],
+    page_categories: Dict[int, List[str]],
 ) -> None:
     pages_sorted = sorted(pages, key=lambda p: normalize_title(p.title).lower())
     records = []
@@ -540,7 +678,8 @@ def write_indexes(
                 "pageid": p.pageid,
                 "namespace": p.ns,
                 "redirect": p.is_redirect,
-                "file": f"pages/{title_to_file[normalize_title(p.title)]}",
+                "categories": page_categories.get(p.pageid, []),
+                "file": f"pages/{title_to_file[title_key(p.title)]}",
             }
         )
 
@@ -616,6 +755,15 @@ def parse_args() -> argparse.Namespace:
             'Can be repeated. Example: "分类:内容页面"'
         ),
     )
+    parser.add_argument(
+        "--page",
+        action="append",
+        default=[],
+        help=(
+            "Only crawl this exact page title. Can be repeated; takes precedence "
+            'over --include-category. Example: "星绘"'
+        ),
+    )
     category_group = parser.add_mutually_exclusive_group()
     category_group.add_argument(
         "--category-recursive",
@@ -671,6 +819,25 @@ def parse_args() -> argparse.Namespace:
         help="Disable built-in noisy-title exclusions.",
     )
     parser.add_argument(
+        "--remove-selector",
+        action="append",
+        default=[],
+        help="Extra CSS selector to strip before conversion. Can be repeated.",
+    )
+    parser.add_argument(
+        "--keep-images",
+        action="store_true",
+        help="Keep images as Markdown image links (dropped by default).",
+    )
+    parser.add_argument(
+        "--keep-external-links",
+        action="store_true",
+        help=(
+            "Keep URLs for external links and wiki pages outside the crawl set "
+            "(by default only the link text is kept)."
+        ),
+    )
+    parser.add_argument(
         "--clean-output",
         action="store_true",
         help="Delete existing output directory before export.",
@@ -709,6 +876,9 @@ def main() -> int:
         output_dir=output_dir,
         timeout=args.timeout,
         min_request_interval=args.request_interval,
+        keep_images=args.keep_images,
+        keep_external_links=args.keep_external_links,
+        extra_remove_selectors=args.remove_selector,
     )
 
     print(f"[info] wiki_url={wiki_url}")
@@ -722,7 +892,10 @@ def main() -> int:
     compiled_exclude_patterns = compile_title_patterns(exclude_patterns)
 
     max_pages = args.max_pages if args.max_pages > 0 else None
-    if args.include_category:
+    if args.page:
+        pages = crawler.list_pages_by_titles(args.page)
+        namespace_ids = sorted({page.ns for page in pages})
+    elif args.include_category:
         pages = crawler.list_pages_from_categories(
             category_titles=args.include_category,
             recursive_subcategories=args.category_recursive,
@@ -747,15 +920,18 @@ def main() -> int:
         f"[info] discovered pages: {len(pages)} "
         f"(namespaces={namespace_ids}, excluded_patterns={len(compiled_exclude_patterns)})"
     )
-    if args.include_category:
+    if args.include_category and not args.page:
         print(
             f"[info] category mode: categories={args.include_category}, "
             f"recursive={args.category_recursive}"
         )
     title_to_file = build_filename_mapping(pages)
+    redirects = crawler.fetch_redirect_map(pages)
+    print(f"[info] redirects resolved to crawled pages: {len(redirects)}")
 
     ok = 0
     failed: List[str] = []
+    page_categories: Dict[int, List[str]] = {}
     total = len(pages)
 
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
@@ -766,16 +942,17 @@ def main() -> int:
         done = 0
         for future in as_completed(future_map):
             done += 1
-            success, message = future.result()
+            success, message, categories = future.result()
             if success:
                 ok += 1
+                page_categories[future_map[future].pageid] = categories
             else:
                 failed.append(message)
 
             if done % 20 == 0 or done == total:
                 print(f"[info] progress {done}/{total} (ok={ok}, failed={len(failed)})")
 
-    write_indexes(output_dir, pages, title_to_file, siteinfo, namespace_ids)
+    write_indexes(output_dir, pages, title_to_file, siteinfo, namespace_ids, page_categories)
 
     print(f"[done] markdown written to: {output_dir}")
     print(f"[done] pages ok: {ok}, failed: {len(failed)}")
