@@ -1,160 +1,162 @@
-# MediaWiki -> Markdown 手动抓取指南（Strinova / klbq）
+# Strinova Wiki 知识库
 
-这个仓库里的 `scripts/mediawiki_to_markdown.py` 是一个通用 MediaWiki 抓取脚本。  
-目标是把站点页面抓取并清洗成可互相链接的 Markdown 文件，输出到 `klbq/`。
+把 [卡拉彼丘 WIKI](https://wiki.biligame.com/klbq/)（MediaWiki 站点）抓取并清洗成
+互相链接的 Markdown 文件，作为 AstrBot 人格（如「星绘」）的嵌入式知识库使用。
 
-适用目标站点示例：`https://wiki.biligame.com/klbq/`
-
----
-
-## 1) 脚本会做什么
-
-- 通过 MediaWiki API 枚举页面
-- 获取页面解析后的 HTML 内容
-- 清理常见噪声（脚本、编辑按钮、引用回链等）
-- 转成 Markdown
-- 将站内链接改写为本地 `./xxx.md` 链接
-- 生成索引文件（`index.json`）与示例入口（`README.md`）
+人物卡只保留角色核心设定，世界观等大量内容交给知识库按需检索，以节省 token。
 
 ---
 
-## 2) 输出目录结构
-
-默认输出目录是 `klbq/`，典型结构如下：
+## 目录结构
 
 ```text
-klbq/
-  pages/
-    <pageid>_<slug>.md
-  index.json
-  failed_pages.log   # 若有失败页则出现
-  README.md
+.
+├── scripts/
+│   ├── mediawiki_to_markdown.py        # 通用 MediaWiki 抓取 + 清洗（主脚本）
+│   ├── merge_knowledgebase.py          # 可选：按主题把页面合并成 7 个大文件
+│   └── clean_offline_knowledgebase.py  # 可选：去掉合并文件里的链接/URL
+├── klbq/                               # 抓取结果（推荐直接作为知识库）
+│   ├── pages/<页面标题>.md
+│   ├── index.json                      # 全部页面元数据（标题/分类/文件名）
+│   └── README.md
+├── knowledgebase/                      # merge_knowledgebase.py 的输出
+├── Knowledgebase_offline/              # clean_offline_knowledgebase.py 的输出
+├── CONTRIBUTING.md                     # 开发 / Git / 数据更新规范
+├── CHANGELOG.md
+└── requirements.txt
 ```
 
 ---
 
-## 3) 先安装依赖（手动执行）
+## 快速开始
 
-建议使用项目虚拟环境，不污染系统 Python：
+### 1. 安装依赖
 
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 ```
 
----
-
-## 4) 按「分类:内容页面」抓取（你当前需求）
-
-> 这条命令 **不会清空已存在目录**，只会在 `klbq/` 内写入/覆盖同名文件。  
-> 只抓 `分类:内容页面` 及其子分类里的页面，适合你给的人格知识库场景。
-
-```bash
-.venv/bin/python scripts/mediawiki_to_markdown.py \
-  --wiki-url "https://wiki.biligame.com/klbq/" \
-  --output-dir klbq \
-  --include-category "分类:内容页面" \
-  --category-recursive \
-  --no-default-exclude-titles \
-  --workers 1 \
-  --request-interval 0.35
-```
-
-说明：
-
-- `--include-category`：从指定分类开始抓
-- `--category-recursive`：递归抓子分类（你列的那一长串子分类会自动覆盖）
-- `--no-default-exclude-titles`：关闭内置排除，避免把你需要的 `帮助:` 页面也排掉
-- `--workers 1` + `--request-interval`：降低并发与请求频率，减少风控/567 失败
-
-如果你只想抓其中几个子分类，可重复写 `--include-category`：
-
-```bash
---include-category "分类:角色" \
---include-category "分类:剧情故事" \
---include-category "分类:武器"
-```
-
----
-
-## 5) 先小规模测试（推荐）
-
-先抓 50 页验证格式与过滤是否满意：
+### 2. 小规模试抓（推荐先做）
 
 ```bash
 .venv/bin/python scripts/mediawiki_to_markdown.py \
   --wiki-url "https://wiki.biligame.com/klbq/" \
   --output-dir klbq_test \
   --include-category "分类:内容页面" \
-  --category-recursive \
   --no-default-exclude-titles \
-  --workers 1 \
-  --request-interval 0.35 \
   --max-pages 50
 ```
 
-确认没问题后再跑全量。
-
----
-
-## 6) 关于 `--clean-output`（危险参数）
-
-脚本支持 `--clean-output`，行为是：
-
-- 如果输出目录存在，先整目录删除，再重新抓取
-
-请只在你明确备份完成时再用。  
-如果不想冒风险，**不要加这个参数**。
-
----
-
-## 7) 常见问题排查
-
-### A. `567 Server Error`
-
-通常是站点风控或瞬时拒绝。可尝试：
-
-- 保持 `--workers 1`
-- 将 `--request-interval` 提高到 `0.5 ~ 1.0`
-- 过一段时间后重试
-
-### B. `ProxyError ... Tunnel connection failed: 403 Forbidden`
-
-通常是当前网络/代理环境阻断（不是脚本逻辑错误）。可尝试：
-
-- 切换网络（如手机热点）
-- 检查系统代理或终端代理变量（`HTTP_PROXY` / `HTTPS_PROXY`）
-- 在无代理或可直连环境重跑
-
-### C. 输出里仍出现少量不需要页面
-
-继续追加排除规则即可，例如：
+只看指定页面（会自动跟随重定向）：
 
 ```bash
---exclude-title-regex "^文件:.*" \
---exclude-title-regex "^分类:.*" \
---exclude-title-regex "^模板:.*"
+.venv/bin/python scripts/mediawiki_to_markdown.py \
+  --wiki-url "https://wiki.biligame.com/klbq/" \
+  --output-dir klbq_test \
+  --page "星绘" --page "星绘/档案馆" --page "弦化"
 ```
 
-如果你已经使用了 `--include-category "分类:内容页面"`，优先先检查是否误加了
-`--include-noncontent` 或其他额外分类。
+`klbq_test*/` 已在 `.gitignore` 中，不会被提交。
+
+### 3. 全量抓取
+
+```bash
+.venv/bin/python scripts/mediawiki_to_markdown.py \
+  --wiki-url "https://wiki.biligame.com/klbq/" \
+  --output-dir klbq_new \
+  --include-category "分类:内容页面" \
+  --no-default-exclude-titles \
+  --workers 1 \
+  --request-interval 0.35
+```
+
+确认 `klbq_new/` 无误后再替换 `klbq/`（见 [CONTRIBUTING.md](CONTRIBUTING.md#更新知识库数据)）。
 
 ---
 
-## 8) 给 AstrBot 人格知识库的建议（节省 token）
+## 输出格式
 
-- 不要把全站都进主提示词
-- 让模型先检索 `klbq/pages/*.md`，只注入命中的片段
-- 针对角色（如星绘）优先保留：
-  - 角色页
-  - 剧情/设定页
-  - 世界观/术语页
-  - 版本活动中与角色相关的公告页
+文件名直接使用页面标题（`/`、`:`、空格等不安全字符替换为 `_`），
+与其他页面重名（不区分大小写）时追加 `_<pageid>`。
+
+```markdown
+---
+title: "星绘/档案馆"
+pageid: 10438
+namespace: 0
+source: https://wiki.biligame.com/klbq/%E6%98%9F%E7%BB%98/%E6%A1%A3%E6%A1%88%E9%A6%86
+categories: ["档案馆"]
+---
+
+# 星绘/档案馆
+
+- [星绘](./星绘.md)
+- [武器](./北极星.md)
+...
+```
+
+- 指向已抓取页面的链接（包括经由重定向的）改写为 `./<文件>.md`
+- 指向未抓取页面 / 站外的链接只保留文字（`--keep-external-links` 可保留 URL）
+- `index.json` 中每页都带 `categories`，可用于分组或过滤
+
+### 默认清洗规则
+
+| 内容 | 处理 |
+| --- | --- |
+| `<script>` / `<style>` / 导航框 / 编辑按钮 | 删除 |
+| 目录（TOC）、面包屑 | 删除 |
+| 图片、音视频、媒体文件直链（`a.internal`） | 删除（`--keep-images` 保留图片） |
+| 编辑 / 历史 / 刷新 / 短链接 / 上传文件等 UI 链接 | 删除 |
+| 参考文献角标与列表 | 删除 |
+| 页内锚点链接、自链接 | 只保留文字 |
+
+站点改版后如出现新的噪声块，用 `--remove-selector "<CSS 选择器>"` 追加，无需改代码。
 
 ---
 
-## 9) 目标站点参考
+## 常用参数
 
-- [卡拉彼丘WIKI](https://wiki.biligame.com/klbq/)
-- [分类:内容页面](https://wiki.biligame.com/klbq/%E5%88%86%E7%B1%BB:%E5%86%85%E5%AE%B9%E9%A1%B5%E9%9D%A2)
+| 参数 | 说明 |
+| --- | --- |
+| `--wiki-url` | 站点根 URL（必填） |
+| `--api-url` | API 地址，默认 `<wiki-url>/api.php` |
+| `--output-dir` | 输出目录，默认 `klbq` |
+| `--page` | 只抓指定标题，可重复；优先于分类模式 |
+| `--include-category` | 从分类开始抓，可重复；默认递归子分类 |
+| `--no-category-recursive` | 分类模式下不递归子分类 |
+| `--namespaces` | 全站模式的命名空间 ID，逗号分隔或 `all` |
+| `--exclude-title-regex` | 按标题排除页面，可重复 |
+| `--no-default-exclude-titles` | 关闭内置的 `分类:` / `模板:` / `帮助:` 等排除规则 |
+| `--remove-selector` | 额外删除的 CSS 选择器，可重复 |
+| `--keep-images` / `--keep-external-links` | 保留图片 / 外链 URL |
+| `--max-pages` | 最多抓取页数（测试用） |
+| `--workers` / `--request-interval` | 并发数 / 最小请求间隔（秒） |
+| `--clean-output` | **先删除整个输出目录**再抓取，谨慎使用 |
 
+完整列表：`.venv/bin/python scripts/mediawiki_to_markdown.py --help`
+
+---
+
+## 用于 AstrBot 知识库
+
+- 推荐直接导入 `klbq/pages/*.md`：一页一个文件，检索命中时来源清晰
+- 按需排除对人格没用、但体积很大的页面，例如：
+
+  ```bash
+  --exclude-title-regex ".*/(画廊|语音台词)$" \
+  --exclude-title-regex ".*PV$"
+  ```
+
+- 人物卡只放星绘的核心设定（`星绘.md` 中的档案信息 + 性格），
+  世界观、阵营、剧情交给知识库检索
+
+---
+
+## 常见问题
+
+**`567 Server Error`**：站点风控。保持 `--workers 1`，把 `--request-interval` 调到 `0.5 ~ 1.0`，稍后重试。
+
+**`ProxyError ... 403 Forbidden`**：网络 / 代理问题，检查 `HTTP_PROXY` / `HTTPS_PROXY` 或换网络。
+
+**失败的页面**：记录在 `<output-dir>/failed_pages.log`，可以用 `--page` 单独补抓。

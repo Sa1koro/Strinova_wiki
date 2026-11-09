@@ -2,13 +2,13 @@
 """
 Merge exported MediaWiki markdown pages into a small number of KB files.
 
-Default grouping roots (seed pages):
-- 公告: 387_page.md
-- 角色: 83_page.md
-- 剧情故事: 25561_page.md
-- 地图: 92_page.md
-- 活动: 1499_page.md
-- 武器: 444_page.md
+Default grouping roots (seed page titles, resolved through index.json):
+- 公告: 公告资讯
+- 角色: 角色筛选
+- 剧情故事: 剧情故事
+- 地图: 地图
+- 活动: 活动
+- 武器: 武器筛选
 
 Remaining pages are grouped into "其他".
 """
@@ -251,13 +251,14 @@ def main() -> int:
     records, by_file, title_to_file = load_index(index_file)
     valid_files = set(by_file.keys())
 
+    # Seeds are page titles so they survive file naming changes in the exporter.
     groups = [
-        ("公告", "01_announcements.md", "pages/387_page.md"),
-        ("角色", "02_characters.md", "pages/83_page.md"),
-        ("剧情故事", "03_story.md", "pages/25561_page.md"),
-        ("地图", "04_maps.md", "pages/92_page.md"),
-        ("活动", "05_events.md", "pages/1499_page.md"),
-        ("武器", "06_weapons.md", "pages/444_page.md"),
+        ("公告", "01_announcements.md", "公告资讯"),
+        ("角色", "02_characters.md", "角色筛选"),
+        ("剧情故事", "03_story.md", "剧情故事"),
+        ("地图", "04_maps.md", "地图"),
+        ("活动", "05_events.md", "活动"),
+        ("武器", "06_weapons.md", "武器筛选"),
     ]
 
     assigned: Set[str] = set()
@@ -267,7 +268,10 @@ def main() -> int:
         "groups": {},
     }
 
-    for group_name, out_name, seed_rel in groups:
+    for group_name, out_name, seed_title in groups:
+        seed_rel = title_to_file.get(normalize_title(seed_title))
+        if not seed_rel:
+            raise FileNotFoundError(f"seed page not in index: {seed_title}")
         collected = collect_group_files(
             seed_file_rel=seed_rel,
             pages_dir=pages_dir,
